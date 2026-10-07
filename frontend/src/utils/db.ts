@@ -11,6 +11,12 @@ import type { Observation } from '@/types/observation'
 import type { Alarm } from '@/types/alarm'
 import type { Pool } from '@/types/pool'
 import { cumulativeOf, dailyRateOf, daysBetween } from '@/utils/threshold'
+import {
+  buildImpactPreview,
+  type ImpactPreview,
+  type OpenAlarmStrategy,
+  type ThresholdChangePlan
+} from '@/utils/recalc'
 
 export const DB_NAME = 'gbtaildam'
 export const DB_VERSION = 2
@@ -402,6 +408,86 @@ export async function recalculateObservations(pointId: string): Promise<void> {
     }
   })
   if (patches.length > 0) await db.observations.bulkPut(patches)
+}
+
+/* ==================== 初值/阈值调整：影响预检与原子提交 ==================== */
+
+/**
+ * 确认提交口径调整：测点新口径 + 观测重算 + 未闭环预警处置在同一事务内完成，
+ * 任一步失败整个事务回滚，不会只落其中一部分；已闭环预警原样保留。
+ * 事务内按当前库内数据重算预检（与页面预览共用 buildImpactPreview，口径一致）。
+ */
+export async function commitThresholdImpact(
+  plans: ThresholdChangePlan[],
+  strategy: OpenAlarmStrategy
+): Promise<ImpactPreview[]> {
+  const previews: ImpactPreview[] = []
+  await db.transaction('rw', [db.points, db.observations, db.alarms], async () => {
+    for (const plan of plans) {
+      const point = await db.points.get(plan.pointId)
+      if (!point) continue
+      const observations = await db.observations.where('pointId').equals(plan.pointId).toArray()
+      const alarms = await db.alarms.where('pointId').equals(plan.pointId).toArray()
+      const preview = buildImpactPreview(point, observations, alarms, plan.nextInitialValue, plan.nextThreshold, strategy)
+      const now = Date.now()
+
+      // 1) 测点新口径（编辑场景连同其它字段一起提交）
+      await db.points.update(plan.pointId, {
+        ...(plan.pointPatch ?? {}),
+        initialValue: plan.nextInitialValue,
+        threshold: plan.nextThreshold > 0 ? plan.nextThreshold : 1,
+        updatedAt: now
+      })
+
+      // 2) 观测累计变化量按新初值重算（日速率只与读数相关，顺带重算保持一致）
+      const sorted = [...observations].sort((a, b) => a.date.localeCompare(b.date))
+      const patches: ObservationRow[] = sorted.map((row, index) => {
+        const previous = index === 0 ? null : sorted[index - 1]
+        return {
+          ...row,
+          cumulative: cumulativeOf(row.reading, plan.nextInitialValue),
+          dailyRate: previous ? dailyRateOf(row.reading, previous.reading, daysBetween(previous.date, row.date)) : 0,
+          updatedAt: now
+        }
+      })
+      if (patches.length > 0) await db.observations.bulkPut(patches)
+
+      // 3) 未闭环预警按预检结果处置；已闭环记录原样保留
+      for (const shift of preview.alarmShifts) {
+        if (shift.action === '不变') continue
+        if (shift.action === '移除') {
+          await db.alarms.delete(shift.id)
+          continue
+        }
+        if (shift.action === '自动闭环') {
+          const alarm = alarms.find((item) => item.id === shift.id)
+          await db.alarms.update(shift.id, {
+            state: '已闭环',
+            handler: alarm && alarm.handler ? alarm.handler : '系统复算',
+            measure: `${alarm && alarm.measure ? `${alarm.measure}；` : ''}初值/阈值调整后复算转正常，自动闭环`,
+            pendingReview: false,
+            updatedAt: now
+          })
+          continue
+        }
+        if (shift.action === '待复核') {
+          await db.alarms.update(shift.id, { pendingReview: true, updatedAt: now })
+          continue
+        }
+        // 更新：仍越限，按新口径刷新触发值与级别
+        if (shift.newLevel !== null && shift.newCumulative !== null) {
+          await db.alarms.update(shift.id, {
+            level: shift.newLevel,
+            triggerValue: shift.newCumulative,
+            updatedAt: now
+          })
+        }
+      }
+
+      previews.push(preview)
+    }
+  })
+  return previews
 }
 
 /* ============================ 本地 UI 偏好 ============================ */

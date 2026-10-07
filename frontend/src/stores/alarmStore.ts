@@ -25,6 +25,8 @@ interface AlarmState_ {
   removeAlarm: (id: string) => Promise<void>
   advance: (id: string) => Promise<AlarmState | null>
   closeAlarm: (id: string, handler: string, measure: string) => Promise<void>
+  /** 人工复核确认后消除「待复核」标记 */
+  clearPendingReview: (id: string) => Promise<void>
   counts: () => Record<AlarmState, number>
   levelCounts: () => Record<AlarmLevel, number>
   closedPercent: () => number
@@ -93,8 +95,13 @@ export const useAlarmStore = create<AlarmState_>((set, get) => ({
       state: '已闭环',
       handler: handler.trim() || '未署名',
       measure: measure.trim() || '处置完成，复测无异常',
+      pendingReview: false,
       updatedAt: Date.now()
     })
+  },
+
+  async clearPendingReview(id) {
+    await db.alarms.update(id, { pendingReview: false, updatedAt: Date.now() })
   },
 
   counts() {

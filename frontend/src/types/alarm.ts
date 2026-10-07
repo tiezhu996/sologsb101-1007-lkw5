@@ -16,6 +16,11 @@ export interface Alarm {
   handler: string
   /** 处置措施 */
   measure: string
+  /**
+   * 待复核标记：初值/阈值调整复算后转为正常（或触发日观测缺失无法复算）的未闭环预警，
+   * 保留原记录并置 true，需在预警处置页人工确认后消除；已闭环记录不置此标记
+   */
+  pendingReview?: boolean
   createdAt: number
   updatedAt: number
 }

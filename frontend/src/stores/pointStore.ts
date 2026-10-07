@@ -30,8 +30,6 @@ interface PointState {
   bulkCreatePoints: (sectionId: string, drafts: PointDraft[]) => Promise<number>
   setThresholdDraft: (pointId: string, draft: ThresholdDraft) => void
   clearThresholdDraft: (pointId?: string) => void
-  commitThresholdDraft: (pointId: string) => Promise<void>
-  commitAllThresholdDrafts: () => Promise<number>
   toggleSelect: (id: string, checked: boolean) => void
   setSelectedIds: (ids: string[]) => void
   clearSelection: () => void
@@ -123,36 +121,6 @@ export const usePointStore = create<PointState>((set, get) => ({
     const next = { ...get().thresholdDraft }
     delete next[pointId]
     set({ thresholdDraft: next })
-  },
-
-  async commitThresholdDraft(pointId) {
-    const draft = get().thresholdDraft[pointId]
-    if (!draft) return
-    await db.points.update(pointId, {
-      initialValue: draft.initialValue,
-      threshold: draft.threshold > 0 ? draft.threshold : 1,
-      updatedAt: Date.now()
-    })
-    get().clearThresholdDraft(pointId)
-  },
-
-  async commitAllThresholdDrafts() {
-    const entries = Object.entries(get().thresholdDraft)
-    if (entries.length === 0) return 0
-    const rows = get()
-      .points.filter((point) => entries.some(([id]) => id === point.id))
-      .map((point) => {
-        const draft = get().thresholdDraft[point.id]
-        return {
-          ...point,
-          initialValue: draft.initialValue,
-          threshold: draft.threshold > 0 ? draft.threshold : 1,
-          updatedAt: Date.now()
-        }
-      })
-    if (rows.length > 0) await db.points.bulkPut(rows)
-    get().clearThresholdDraft()
-    return rows.length
   },
 
   toggleSelect(id, checked) {

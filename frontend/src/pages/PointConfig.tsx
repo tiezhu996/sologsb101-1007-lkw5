@@ -1,18 +1,29 @@
 /**
  * /points 测点布设与阈值配置
- * 按断面批量建点、逐点设初值与阈值；阈值改动先进草稿，再逐条或批量提交。
+ * 按断面批量建点、逐点设初值与阈值；口径改动先进草稿，提交前先做影响预检，
+ * 确认后测点、观测重算与未闭环预警在同一事务落库。
  * 消费 Point、Section；复用 <FilterBar>、<EmptyPanel>、<StatBadge>。
  */
 import { useMemo, useState } from 'react'
-import { App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag } from 'antd'
+import { App as AntdApp, Alert, Button, Form, Input, InputNumber, Modal, Popconfirm, Radio, Select, Space, Table, Tag } from 'antd'
 import type { TableColumnsType } from 'antd'
+import AlarmTag from '@/components/common/AlarmTag'
 import EmptyPanel from '@/components/common/EmptyPanel'
 import FilterBar, { type FilterModel } from '@/components/common/FilterBar'
 import StatBadge from '@/components/common/StatBadge'
 import { useDamStore } from '@/stores/damStore'
 import { usePointStore } from '@/stores/pointStore'
 import { useIdbTable } from '@/hooks/useIdbTable'
-import { db, type ObservationRow } from '@/utils/db'
+import { commitThresholdImpact, db, type AlarmRow, type ObservationRow } from '@/utils/db'
+import {
+  buildImpactPreview,
+  type AlarmShift,
+  type ImpactPreview,
+  type LevelShift,
+  type ObservationShift,
+  type OpenAlarmStrategy,
+  type ThresholdChangePlan
+} from '@/utils/recalc'
 import {
   EMPTY_POINT_DRAFT,
   POINT_TYPES,
@@ -21,6 +32,7 @@ import {
   type PointDraft,
   type PointType
 } from '@/types/point'
+import type { AlarmLevel } from '@/types/alarm'
 import { alarmLevelOf, isExceeded, ratioOf } from '@/utils/threshold'
 
 interface BulkDraft {
@@ -33,17 +45,53 @@ interface BulkDraft {
   installDate: string
 }
 
+/** 预检中未闭环预警处置动作的标记色 */
+const ALARM_ACTION_COLOR: Record<AlarmShift['action'], string> = {
+  更新: 'blue',
+  待复核: 'gold',
+  自动闭环: 'green',
+  移除: 'red',
+  不变: 'default'
+}
+
 export default function PointConfig() {
   const { message } = AntdApp.useApp()
   const damStore = useDamStore()
   const pointStore = usePointStore()
   const observationTable = useIdbTable<ObservationRow>(db.observations)
+  const alarmTable = useIdbTable<AlarmRow>(db.alarms, { sortByUpdatedAt: false })
 
   const [pointForm] = Form.useForm<PointDraft>()
   const [bulkForm] = Form.useForm<BulkDraft>()
   const [pointOpen, setPointOpen] = useState(false)
   const [bulkOpen, setBulkOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
+
+  /** 影响预检：待确认的口径调整计划与未闭环预警处理策略（默认保留待复核） */
+  const [precheckPlans, setPrecheckPlans] = useState<ThresholdChangePlan[]>([])
+  const [precheckOpen, setPrecheckOpen] = useState(false)
+  const [strategy, setStrategy] = useState<OpenAlarmStrategy>('keep')
+  const [committing, setCommitting] = useState(false)
+
+  /** 预检结果：按当前库内观测与预警随策略选择实时复算，确认前不写入任何数据 */
+  const precheckPreviews = useMemo(
+    () =>
+      precheckPlans
+        .map((plan) => {
+          const point = pointStore.points.find((item) => item.id === plan.pointId)
+          if (!point) return null
+          return buildImpactPreview(
+            point,
+            observationTable.rows.filter((row) => row.pointId === plan.pointId),
+            alarmTable.rows.filter((row) => row.pointId === plan.pointId),
+            plan.nextInitialValue,
+            plan.nextThreshold,
+            strategy
+          )
+        })
+        .filter((item): item is ImpactPreview => item !== null),
+    [precheckPlans, pointStore.points, observationTable.rows, alarmTable.rows, strategy]
+  )
 
   const filter = pointStore.filter
   const filterSelects = useMemo(
@@ -144,6 +192,28 @@ export default function PointConfig() {
     if (!values) return
     const payload: PointDraft = { ...values, unit: values.unit || POINT_UNIT[values.type] }
     if (editingId) {
+      const point = pointStore.points.find((item) => item.id === editingId)
+      const nextThreshold = payload.threshold > 0 ? payload.threshold : 1
+      if (point && (payload.initialValue !== point.initialValue || nextThreshold !== point.threshold)) {
+        // 口径变化：先做影响预检，确认后测点字段、观测重算与未闭环预警在同一事务提交
+        const section = damStore.sections.find((item) => item.id === payload.sectionId)
+        openPrecheck([
+          {
+            pointId: editingId,
+            nextInitialValue: payload.initialValue,
+            nextThreshold,
+            pointPatch: {
+              sectionId: payload.sectionId,
+              damId: section ? section.damId : point.damId,
+              code: payload.code.trim(),
+              type: payload.type,
+              unit: payload.unit,
+              installDate: payload.installDate
+            }
+          }
+        ])
+        return
+      }
       await pointStore.updatePoint(editingId, payload)
       message.success('测点已更新')
     } else {
@@ -193,13 +263,76 @@ export default function PointConfig() {
     setBulkOpen(false)
   }
 
-  const commitAll = async (): Promise<void> => {
-    const count = await pointStore.commitAllThresholdDrafts()
-    if (count === 0) {
+  /** 行内「保存」：口径草稿先进入影响预检，确认后才写入 */
+  const saveRowDraft = (record: Point): void => {
+    const draft = pointStore.thresholdDraft[record.id]
+    if (!draft) return
+    const nextThreshold = draft.threshold > 0 ? draft.threshold : 1
+    if (draft.initialValue === record.initialValue && nextThreshold === record.threshold) {
+      pointStore.clearThresholdDraft(record.id)
+      message.info('初值与阈值未变化，无需提交')
+      return
+    }
+    openPrecheck([{ pointId: record.id, nextInitialValue: draft.initialValue, nextThreshold }])
+  }
+
+  /** 批量提交：全部草稿一起做影响预检，确认后同一事务落库 */
+  const commitAll = (): void => {
+    const entries = Object.entries(pointStore.thresholdDraft)
+    if (entries.length === 0) {
       message.warning('没有待提交的阈值草稿')
       return
     }
-    message.success(`已提交 ${count} 个测点的初值与阈值`)
+    const plans: ThresholdChangePlan[] = []
+    entries.forEach(([pointId, draft]) => {
+      const point = pointStore.points.find((item) => item.id === pointId)
+      if (!point) return
+      const nextThreshold = draft.threshold > 0 ? draft.threshold : 1
+      if (draft.initialValue === point.initialValue && nextThreshold === point.threshold) return
+      plans.push({ pointId, nextInitialValue: draft.initialValue, nextThreshold })
+    })
+    if (plans.length === 0) {
+      pointStore.clearThresholdDraft()
+      message.info('草稿与现行口径一致，无需提交')
+      return
+    }
+    openPrecheck(plans)
+  }
+
+  const openPrecheck = (plans: ThresholdChangePlan[]): void => {
+    setPrecheckPlans(plans)
+    setStrategy('keep')
+    setPrecheckOpen(true)
+  }
+
+  /** 取消预检：不写入任何改动，草稿保留可继续调整 */
+  const closePrecheck = (): void => {
+    setPrecheckOpen(false)
+    setPrecheckPlans([])
+  }
+
+  const confirmPrecheck = async (): Promise<void> => {
+    if (precheckPlans.length === 0) return
+    setCommitting(true)
+    try {
+      const previews = await commitThresholdImpact(precheckPlans, strategy)
+      precheckPlans.forEach((plan) => pointStore.clearThresholdDraft(plan.pointId))
+      const observationCount = previews.reduce((sum, item) => sum + item.totalObservations, 0)
+      const alarmCount = previews.reduce(
+        (sum, item) => sum + item.alarmShifts.filter((shift) => shift.action !== '不变').length,
+        0
+      )
+      message.success(
+        `已按新口径提交 ${previews.length} 个测点：重算观测 ${observationCount} 条，处置未闭环预警 ${alarmCount} 张`
+      )
+      closePrecheck()
+      setPointOpen(false)
+    } catch (error) {
+      // 事务整体回滚，不会出现只落一部分的中间态
+      message.error(`提交失败，全部改动已回滚：${error instanceof Error ? error.message : '未知错误'}`)
+    } finally {
+      setCommitting(false)
+    }
   }
 
   const columns: TableColumnsType<Point> = [
@@ -247,10 +380,7 @@ export default function PointConfig() {
               type="link"
               size="small"
               disabled={!draft}
-              onClick={async () => {
-                await pointStore.commitThresholdDraft(record.id)
-                message.success(`${record.code} 初值与阈值已保存`)
-              }}
+              onClick={() => saveRowDraft(record)}
             >
               保存
             </Button>
@@ -292,13 +422,80 @@ export default function PointConfig() {
     }
   ]
 
+  const renderLevel = (level: AlarmLevel | null) =>
+    level ? <AlarmTag level={level} size="small" /> : <Tag color="green">正常</Tag>
+
+  const observationShiftColumns: TableColumnsType<ObservationShift> = [
+    { title: '日期', dataIndex: 'date', width: 110 },
+    { title: '读数', dataIndex: 'reading', width: 90, render: (value: number) => value.toFixed(3) },
+    {
+      title: '累计变化（旧 → 新）',
+      width: 170,
+      render: (_value, record) => `${record.oldCumulative.toFixed(3)} → ${record.newCumulative.toFixed(3)}`
+    },
+    {
+      title: '级别（旧 → 新）',
+      width: 210,
+      render: (_value, record) => (
+        <Space size={4}>
+          {renderLevel(record.oldLevel)}
+          <span>→</span>
+          {renderLevel(record.newLevel)}
+        </Space>
+      )
+    },
+    {
+      title: '变化',
+      dataIndex: 'shift',
+      width: 90,
+      render: (value: LevelShift) => (
+        <Tag color={value === '升高' ? 'red' : value === '降低' ? 'blue' : 'green'}>{value}</Tag>
+      )
+    }
+  ]
+
+  const alarmShiftColumns: TableColumnsType<AlarmShift> = [
+    { title: '触发日期', dataIndex: 'triggerDate', width: 110 },
+    { title: '当前状态', dataIndex: 'state', width: 90 },
+    {
+      title: '原级别 / 触发值',
+      width: 190,
+      render: (_value, record) => (
+        <Space size={4}>
+          <AlarmTag level={record.oldLevel} size="small" />
+          <span>{record.oldTriggerValue.toFixed(3)}</span>
+        </Space>
+      )
+    },
+    {
+      title: '复算级别 / 触发值',
+      width: 190,
+      render: (_value, record) => {
+        if (record.newCumulative === null) return <Tag color="gold">无法复算</Tag>
+        if (record.newLevel === null) return <Tag color="green">正常</Tag>
+        return (
+          <Space size={4}>
+            <AlarmTag level={record.newLevel} size="small" />
+            <span>{record.newCumulative.toFixed(3)}</span>
+          </Space>
+        )
+      }
+    },
+    {
+      title: '处理方式',
+      dataIndex: 'action',
+      width: 100,
+      render: (value: AlarmShift['action']) => <Tag color={ALARM_ACTION_COLOR[value]}>{value}</Tag>
+    }
+  ]
+
   return (
     <div>
       <div className="page-head">
         <div>
           <h2 className="page-head__title">测点布设与阈值配置</h2>
           <p className="page-head__desc">
-            按断面批量布点并配置初值与阈值；越限判定按「累计变化量 ÷ 阈值」分蓝/黄/橙/红四级。
+            按断面批量布点并配置初值与阈值；口径调整先做影响预检，确认后观测与未闭环预警一并重算。
           </p>
         </div>
         <div className="page-head__actions">
@@ -336,7 +533,7 @@ export default function PointConfig() {
           <h3 className="panel-title" style={{ margin: 0 }}>
             测点清单（{rows.length} / {pointStore.points.length}）
           </h3>
-          <span className="muted">阈值改动先进入草稿，确认后再提交</span>
+          <span className="muted">口径改动先进入草稿，提交前需通过影响预检确认</span>
         </div>
         {rows.length === 0 ? (
           <EmptyPanel
@@ -422,6 +619,91 @@ export default function PointConfig() {
             <Input placeholder="YYYY-MM-DD" />
           </Form.Item>
         </Form>
+      </Modal>
+
+      <Modal
+        open={precheckOpen}
+        title="影响预检 · 初值/阈值调整"
+        onCancel={closePrecheck}
+        onOk={confirmPrecheck}
+        okText="确认提交"
+        cancelText="取消"
+        width={900}
+        confirmLoading={committing}
+        destroyOnClose
+      >
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message="以下为按新口径复算的影响预检，确认后测点、观测与未闭环预警在同一事务中提交（任一步失败全部回滚）；取消则不写入任何改动。"
+        />
+        {precheckPreviews.map((preview) => (
+          <div key={preview.pointId} className="panel" style={{ marginBottom: 12 }}>
+            <div className="panel-head">
+              <h4 style={{ margin: 0 }}>
+                {preview.pointCode} · 初值 {preview.oldInitialValue} → {preview.nextInitialValue} · 阈值{' '}
+                {preview.oldThreshold} → {preview.nextThreshold} {preview.unit}
+              </h4>
+            </div>
+            <Space size={8} wrap style={{ margin: '8px 0' }}>
+              <span>观测 {preview.totalObservations} 条：</span>
+              <Tag color="red">级别升高 {preview.raised}</Tag>
+              <Tag color="blue">级别降低 {preview.lowered}</Tag>
+              <Tag color="green">转正常 {preview.normalized}</Tag>
+              <Tag>不变 {preview.unchanged}</Tag>
+            </Space>
+            {preview.observationShifts.length > 0 ? (
+              <Table<ObservationShift>
+                rowKey="id"
+                size="small"
+                bordered
+                dataSource={preview.observationShifts}
+                columns={observationShiftColumns}
+                pagination={false}
+                scroll={{ y: 240 }}
+              />
+            ) : (
+              <p className="muted">观测级别均无变化</p>
+            )}
+            <h4 style={{ margin: '12px 0 8px' }}>受影响未闭环预警（{preview.alarmShifts.length}）</h4>
+            {preview.alarmShifts.length > 0 ? (
+              <Table<AlarmShift>
+                rowKey="id"
+                size="small"
+                bordered
+                dataSource={preview.alarmShifts}
+                columns={alarmShiftColumns}
+                pagination={false}
+              />
+            ) : (
+              <p className="muted">无受影响的未闭环预警</p>
+            )}
+            <p className="muted" style={{ marginTop: 8 }}>
+              已闭环预警 {preview.closedAlarmCount} 张原样保留
+            </p>
+          </div>
+        ))}
+        <div className="panel">
+          <h4 style={{ margin: '0 0 8px' }}>复算后转正常的未闭环预警如何处理</h4>
+          <Radio.Group value={strategy} onChange={(event) => setStrategy(event.target.value as OpenAlarmStrategy)}>
+            <Space direction="vertical">
+              <Radio value="keep">
+                保留为待复核（默认）—— 保留原记录并加「待复核」标记，由值班员在预警处置页人工确认后消除
+              </Radio>
+              <Radio value="close">自动闭环 —— 直接置为已闭环，措施栏注明「复算转正常」</Radio>
+              <Radio value="remove">直接移除 —— 删除转正常的预警单，不留痕</Radio>
+            </Space>
+          </Radio.Group>
+          {strategy !== 'keep' ? (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginTop: 8 }}
+              message="自动闭环或直接移除会跳过人工复核，可能抹掉本该人工确认的风险记录，请确认已知晓。"
+            />
+          ) : null}
+        </div>
       </Modal>
     </div>
   )

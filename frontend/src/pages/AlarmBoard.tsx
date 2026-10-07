@@ -83,6 +83,8 @@ export default function AlarmBoard() {
 
   const counts = alarmStore.counts()
   const levelCounts = alarmStore.levelCounts()
+  /** 口径调整复算后转正常、待人工复核确认的未闭环预警数 */
+  const reviewCount = alarmStore.alarms.filter((alarm) => alarm.pendingReview === true).length
 
   const openCreate = (): void => {
     if (pointStore.points.length === 0) {
@@ -124,6 +126,12 @@ export default function AlarmBoard() {
   const remove = async (alarm: Alarm): Promise<void> => {
     await alarmStore.removeAlarm(alarm.id)
     message.success('预警单已删除')
+  }
+
+  /** 人工复核确认：消除「待复核」标记，记录保留 */
+  const confirmReview = async (alarm: Alarm): Promise<void> => {
+    await alarmStore.clearPendingReview(alarm.id)
+    message.success('该预警已人工复核，待复核标记已消除')
   }
 
   const advance = async (alarm: Alarm): Promise<void> => {
@@ -188,23 +196,37 @@ export default function AlarmBoard() {
     },
     {
       title: '状态',
-      width: 110,
+      width: 150,
       render: (_value, record) => (
-        <Tag color={record.state === '已闭环' ? 'green' : record.state === '处置中' ? 'blue' : 'orange'}>
-          {record.state}
-        </Tag>
+        <Space size={4}>
+          <Tag color={record.state === '已闭环' ? 'green' : record.state === '处置中' ? 'blue' : 'orange'}>
+            {record.state}
+          </Tag>
+          {record.pendingReview ? <Tag color="gold">待复核</Tag> : null}
+        </Space>
       )
     },
     { title: '处置人', dataIndex: 'handler', width: 100, render: (value: string) => value || '—' },
     { title: '处置措施', dataIndex: 'measure', width: 220, render: (value: string) => value || '—' },
     {
       title: '操作',
-      width: 220,
+      width: 280,
       render: (_value, record) => (
         <Space size={4}>
           <Button type="link" size="small" disabled={!ALARM_STATE_FLOW[record.state]} onClick={() => advance(record)}>
             {ALARM_STATE_FLOW[record.state] === '处置中' ? '开始处置' : ALARM_STATE_FLOW[record.state] === '已闭环' ? '闭环' : '已闭环'}
           </Button>
+          {record.pendingReview ? (
+            <Popconfirm
+              title="确认已人工复核该预警？"
+              description="复核确认后消除「待复核」标记，记录保留。"
+              onConfirm={() => confirmReview(record)}
+            >
+              <Button type="link" size="small">
+                复核确认
+              </Button>
+            </Popconfirm>
+          ) : null}
           <Button type="link" size="small" onClick={() => openEdit(record)}>
             编辑
           </Button>
@@ -224,7 +246,7 @@ export default function AlarmBoard() {
         <div>
           <h2 className="page-head__title">预警触发与处置闭环</h2>
           <p className="page-head__desc">
-            按级别（红 &gt; 橙 &gt; 黄 &gt; 蓝）排序处置，填写处置人与措施后闭环归档。
+            按级别（红 &gt; 橙 &gt; 黄 &gt; 蓝）排序处置，填写处置人与措施后闭环归档；口径调整复算转正常的预警带「待复核」标记，需人工复核确认。
           </p>
         </div>
         <div className="page-head__actions">
@@ -245,6 +267,7 @@ export default function AlarmBoard() {
         <StatBadge label="预警总数" value={alarmStore.alarms.length} suffix="张" tone="primary" />
         <StatBadge label="待处置" value={counts['待处置']} suffix="张" tone="warning" />
         <StatBadge label="处置中" value={counts['处置中']} suffix="张" tone="info" />
+        <StatBadge label="待复核" value={reviewCount} suffix="张" tone="danger" hint="口径调整复算后转正常，需人工复核确认" />
         <StatBadge label="闭环率" value={alarmStore.closedPercent()} percent={alarmStore.closedPercent()} tone="danger" hint={`红 ${levelCounts['红']} / 橙 ${levelCounts['橙']} / 黄 ${levelCounts['黄']} / 蓝 ${levelCounts['蓝']}`} />
       </div>
 
