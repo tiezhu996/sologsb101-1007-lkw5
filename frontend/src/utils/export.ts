@@ -97,7 +97,7 @@ export function exportObservationCsv(
 
 /** 预警与闭环台账 CSV */
 export function exportAlarmCsv(dams: Dam[], points: Point[], alarms: Alarm[]): string {
-  const header = ['坝体', '测点编号', '测点类型', '级别', '触发值', '触发日期', '状态', '处置人', '处置措施']
+  const header = ['坝体', '测点编号', '测点类型', '级别', '触发值', '触发日期', '状态', '待复核', '复核原因', '处置人', '处置措施']
   const lines: string[] = [header.map(csvCell).join(',')]
   alarms.forEach((alarm) => {
     const point = points.find((item) => item.id === alarm.pointId)
@@ -111,6 +111,8 @@ export function exportAlarmCsv(dams: Dam[], points: Point[], alarms: Alarm[]): s
         alarm.triggerValue,
         alarm.triggerDate,
         alarm.state,
+        alarm.reviewFlag === true ? '待复核' : '—',
+        alarm.reviewFlag === true ? alarm.reviewNote || '初值/阈值重算转正常，待人工确认' : '—',
         alarm.handler || '—',
         alarm.measure || '—'
       ]

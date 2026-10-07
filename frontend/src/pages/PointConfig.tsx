@@ -9,6 +9,7 @@ import type { TableColumnsType } from 'antd'
 import EmptyPanel from '@/components/common/EmptyPanel'
 import FilterBar, { type FilterModel } from '@/components/common/FilterBar'
 import StatBadge from '@/components/common/StatBadge'
+import RecheckPreviewModal from '@/components/recheck/RecheckPreviewModal'
 import { useDamStore } from '@/stores/damStore'
 import { usePointStore } from '@/stores/pointStore'
 import { useIdbTable } from '@/hooks/useIdbTable'
@@ -21,6 +22,7 @@ import {
   type PointDraft,
   type PointType
 } from '@/types/point'
+import type { RecheckDraft } from '@/types/recheck'
 import { alarmLevelOf, isExceeded, ratioOf } from '@/utils/threshold'
 
 interface BulkDraft {
@@ -44,6 +46,9 @@ export default function PointConfig() {
   const [pointOpen, setPointOpen] = useState(false)
   const [bulkOpen, setBulkOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
+  /** 预检弹窗草稿（单测点或多测点）；为空时弹窗关闭 */
+  const [recheckDrafts, setRecheckDrafts] = useState<RecheckDraft[]>([])
+  const [recheckTitle, setRecheckTitle] = useState<string>('')
 
   const filter = pointStore.filter
   const filterSelects = useMemo(
@@ -144,6 +149,32 @@ export default function PointConfig() {
     if (!values) return
     const payload: PointDraft = { ...values, unit: values.unit || POINT_UNIT[values.type] }
     if (editingId) {
+      const current = pointStore.points.find((item) => item.id === editingId)
+      const caliberChanged =
+        current &&
+        (Number(values.initialValue) !== current.initialValue ||
+          Number(values.threshold) !== current.threshold ||
+          payload.unit !== current.unit)
+      if (caliberChanged) {
+        // 初值/阈值（含单位）变化：先影响预检，确认后测点、观测、预警单事务一起提交
+        setRecheckTitle(`编辑测点 · ${current.code}：初值/阈值调整预检`)
+        setRecheckDrafts([
+          {
+            pointId: editingId,
+            initialValue: Number(values.initialValue) || 0,
+            threshold: Number(values.threshold) > 0 ? Number(values.threshold) : 1,
+            unit: payload.unit,
+            patch: {
+              code: payload.code,
+              type: payload.type,
+              sectionId: payload.sectionId,
+              installDate: payload.installDate
+            }
+          }
+        ])
+        setPointOpen(false)
+        return
+      }
       await pointStore.updatePoint(editingId, payload)
       message.success('测点已更新')
     } else {
@@ -193,13 +224,37 @@ export default function PointConfig() {
     setBulkOpen(false)
   }
 
-  const commitAll = async (): Promise<void> => {
-    const count = await pointStore.commitAllThresholdDrafts()
-    if (count === 0) {
+  const commitAll = (): void => {
+    const entries = Object.entries(pointStore.thresholdDraft)
+    if (entries.length === 0) {
       message.warning('没有待提交的阈值草稿')
       return
     }
-    message.success(`已提交 ${count} 个测点的初值与阈值`)
+    const drafts: RecheckDraft[] = entries.map(([pointId, draft]) => {
+      const point = pointStore.points.find((item) => item.id === pointId)
+      return {
+        pointId,
+        initialValue: Number(draft.initialValue) || 0,
+        threshold: Number(draft.threshold) > 0 ? Number(draft.threshold) : 1,
+        unit: point ? point.unit : ''
+      }
+    })
+    setRecheckTitle(`批量提交初值/阈值草稿（${drafts.length} 个测点）· 影响预检`)
+    setRecheckDrafts(drafts)
+  }
+
+  const commitRow = (point: Point): void => {
+    const draft = pointStore.thresholdDraft[point.id]
+    if (!draft) return
+    setRecheckTitle(`保存测点 · ${point.code}：初值/阈值调整预检`)
+    setRecheckDrafts([
+      {
+        pointId: point.id,
+        initialValue: Number(draft.initialValue) || 0,
+        threshold: Number(draft.threshold) > 0 ? Number(draft.threshold) : 1,
+        unit: point.unit
+      }
+    ])
   }
 
   const columns: TableColumnsType<Point> = [
@@ -247,12 +302,9 @@ export default function PointConfig() {
               type="link"
               size="small"
               disabled={!draft}
-              onClick={async () => {
-                await pointStore.commitThresholdDraft(record.id)
-                message.success(`${record.code} 初值与阈值已保存`)
-              }}
+              onClick={() => commitRow(record)}
             >
-              保存
+              预检保存
             </Button>
           </Space>
         )
@@ -304,7 +356,7 @@ export default function PointConfig() {
         <div className="page-head__actions">
           <Button onClick={openBulk}>批量布点</Button>
           <Button disabled={Object.keys(pointStore.thresholdDraft).length === 0} onClick={commitAll}>
-            提交阈值草稿（{Object.keys(pointStore.thresholdDraft).length}）
+            预检并提交草稿（{Object.keys(pointStore.thresholdDraft).length}）
           </Button>
           <Button type="primary" onClick={openCreate}>
             新增测点
@@ -336,7 +388,7 @@ export default function PointConfig() {
           <h3 className="panel-title" style={{ margin: 0 }}>
             测点清单（{rows.length} / {pointStore.points.length}）
           </h3>
-          <span className="muted">阈值改动先进入草稿，确认后再提交</span>
+          <span className="muted">阈值改动先进草稿，保存/提交前先做影响预检，未确认不写入</span>
         </div>
         {rows.length === 0 ? (
           <EmptyPanel
@@ -423,6 +475,13 @@ export default function PointConfig() {
           </Form.Item>
         </Form>
       </Modal>
+
+      <RecheckPreviewModal
+        open={recheckDrafts.length > 0}
+        drafts={recheckDrafts}
+        title={recheckTitle}
+        onClose={() => setRecheckDrafts([])}
+      />
     </div>
   )
 }

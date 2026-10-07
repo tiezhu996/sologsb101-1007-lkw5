@@ -10,7 +10,13 @@ import type { Point } from '@/types/point'
 import type { Observation } from '@/types/observation'
 import type { Alarm } from '@/types/alarm'
 import type { Pool } from '@/types/pool'
-import { cumulativeOf, dailyRateOf, daysBetween } from '@/utils/threshold'
+import { alarmLevelOf, cumulativeOf, dailyRateOf, daysBetween, round } from '@/utils/threshold'
+import {
+  DEFAULT_RECHECK_POLICY,
+  type RecheckCommitResult,
+  type RecheckDraft,
+  type RecheckPolicy
+} from '@/types/recheck'
 
 export const DB_NAME = 'gbtaildam'
 export const DB_VERSION = 2
@@ -402,6 +408,162 @@ export async function recalculateObservations(pointId: string): Promise<void> {
     }
   })
   if (patches.length > 0) await db.observations.bulkPut(patches)
+}
+
+/* ====================== 初值/阈值调整：预检装载与原子提交 ====================== */
+
+export interface RecheckLoadResult {
+  draft: RecheckDraft
+  point: PointRow
+  observations: ObservationRow[]
+  alarms: AlarmRow[]
+}
+
+/** 预检装载：把草稿与库内现行的测点、观测、预警一并取出（只读） */
+export async function loadRecheckInputs(drafts: RecheckDraft[]): Promise<RecheckLoadResult[]> {
+  const results: RecheckLoadResult[] = []
+  for (const draft of drafts) {
+    const point = await db.points.get(draft.pointId)
+    if (!point) continue
+    const [observations, alarms] = await Promise.all([
+      db.observations.where('pointId').equals(draft.pointId).toArray(),
+      db.alarms.where('pointId').equals(draft.pointId).toArray()
+    ])
+    results.push({ draft, point, observations, alarms })
+  }
+  return results
+}
+
+/**
+ * 确认后提交初值/阈值调整：测点、观测累计量、未闭环预警在同一个读写事务内提交。
+ * 任一环节抛错则整个事务回滚，不会出现只落测点/观测/预警其中一部分的情况。
+ *
+ * 处置规则：
+ * - 已闭环预警原样保留，不重判
+ * - 未闭环且重算仍越限：更新 triggerValue 与 level（保留状态/处置人/措施）
+ * - 未闭环且重算转正常：按策略 加待复核标记（默认）/ 删除 / 自动闭环
+ */
+export async function commitRecheck(
+  drafts: RecheckDraft[],
+  policy: RecheckPolicy = DEFAULT_RECHECK_POLICY
+): Promise<RecheckCommitResult> {
+  const result: RecheckCommitResult = {
+    pointIds: [],
+    observationUpdated: 0,
+    alarmsUpdated: 0,
+    alarmsFlagged: 0,
+    alarmsRemoved: 0,
+    alarmsAutoClosed: 0
+  }
+  if (drafts.length === 0) return result
+
+  const now = Date.now()
+
+  await db.transaction('rw', db.points, db.observations, db.alarms, async () => {
+    for (const draft of drafts) {
+      const point = await db.points.get(draft.pointId)
+      if (!point) continue
+      const initialAfter = Number(draft.initialValue) || 0
+      const thresholdAfter = draft.threshold > 0 ? draft.threshold : 1
+      const unitAfter = draft.unit?.trim() || point.unit
+
+      // 1) 更新测点口径（编辑弹窗带来的基础字段一并提交）
+      const pointPatch: Partial<PointRow> = {
+        initialValue: initialAfter,
+        threshold: thresholdAfter,
+        unit: unitAfter,
+        updatedAt: now
+      }
+      if (draft.patch) {
+        const extra = draft.patch
+        if (extra.code !== undefined) pointPatch.code = extra.code.trim()
+        if (extra.type !== undefined) pointPatch.type = extra.type
+        if (extra.installDate !== undefined) pointPatch.installDate = extra.installDate
+        if (extra.sectionId !== undefined && extra.sectionId) {
+          const section = await db.sections.get(extra.sectionId)
+          pointPatch.sectionId = extra.sectionId
+          pointPatch.damId = section ? section.damId : point.damId
+        }
+      }
+      await db.points.update(point.id, pointPatch)
+      result.pointIds.push(point.id)
+
+      // 2) 顺着观测序列重算累计量（日速率只与相邻读数有关，初值/阈值调整不影响）
+      const observations = (await db.observations.where('pointId').equals(point.id).toArray()).sort((a, b) =>
+        a.date.localeCompare(b.date)
+      )
+      if (observations.length > 0) {
+        const nextObservations = observations.map((row) => ({
+          ...row,
+          cumulative: cumulativeOf(row.reading, initialAfter),
+          updatedAt: now
+        }))
+        await db.observations.bulkPut(nextObservations)
+        result.observationUpdated += nextObservations.length
+      }
+
+      // 3) 重判预警：已闭环原样保留；未闭环按新口径更新或按策略处置
+      const alarms = await db.alarms.where('pointId').equals(point.id).toArray()
+      const observationByDate = new Map<string, ObservationRow>()
+      observations.forEach((row) => {
+        const existing = observationByDate.get(row.date)
+        if (!existing || row.updatedAt > existing.updatedAt) observationByDate.set(row.date, row)
+      })
+
+      for (const alarm of alarms) {
+        if (alarm.state === '已闭环') continue
+        const matched = observationByDate.get(alarm.triggerDate)
+        const triggerValueAfter = matched
+          ? cumulativeOf(matched.reading, initialAfter)
+          : round(alarm.triggerValue + (point.initialValue - initialAfter), 3)
+        const nextLevel = alarmLevelOf(triggerValueAfter, thresholdAfter)
+
+        if (nextLevel !== null) {
+          // 仍越限：更新触发值与级别，状态/处置人/措施保持不变
+          if (triggerValueAfter !== alarm.triggerValue || nextLevel !== alarm.level) {
+            await db.alarms.update(alarm.id, {
+              triggerValue: triggerValueAfter,
+              level: nextLevel,
+              reviewFlag: false,
+              reviewNote: '',
+              reviewAt: undefined,
+              updatedAt: now
+            })
+            result.alarmsUpdated += 1
+          }
+          continue
+        }
+
+        // 转为正常：按策略处置
+        if (policy === 'remove') {
+          await db.alarms.delete(alarm.id)
+          result.alarmsRemoved += 1
+        } else if (policy === 'autoclose') {
+          await db.alarms.update(alarm.id, {
+            state: '已闭环',
+            handler: alarm.handler || '系统重判',
+            measure:
+              alarm.measure ||
+              `初值/阈值调整后重算转正常（${new Date(now).toISOString().slice(0, 10)}），系统自动闭环`,
+            updatedAt: now
+          })
+          result.alarmsAutoClosed += 1
+        } else {
+          // 默认 keep：保留为待复核记录，交值班员人工确认
+          await db.alarms.update(alarm.id, {
+            triggerValue: triggerValueAfter,
+            reviewFlag: true,
+            reviewNote: `初值/阈值于 ${new Date(now).toISOString().slice(0, 10)} 重判：${point.code} 该记录按新口径转为正常，原${alarm.level}色预警保留待人工确认`,
+            reviewAt: now,
+            updatedAt: now
+          })
+          result.alarmsFlagged += 1
+        }
+      }
+    }
+  })
+
+  return result
 }
 
 /* ============================ 本地 UI 偏好 ============================ */

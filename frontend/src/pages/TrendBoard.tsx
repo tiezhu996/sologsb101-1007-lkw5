@@ -22,6 +22,7 @@ import AlarmTag from '@/components/common/AlarmTag'
 import EmptyPanel from '@/components/common/EmptyPanel'
 import FilterBar, { type FilterModel } from '@/components/common/FilterBar'
 import StatBadge from '@/components/common/StatBadge'
+import RecheckPreviewModal from '@/components/recheck/RecheckPreviewModal'
 import { useDamStore } from '@/stores/damStore'
 import { usePointStore } from '@/stores/pointStore'
 import { useAlarmStore } from '@/stores/alarmStore'
@@ -29,6 +30,7 @@ import { useAlarmLevel } from '@/hooks/useAlarmLevel'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import { db, type ObservationRow } from '@/utils/db'
 import { POINT_TYPES, type Point, type PointType } from '@/types/point'
+import type { RecheckDraft } from '@/types/recheck'
 import { formatRate, formatReading, ratioOf } from '@/utils/threshold'
 
 interface TrendRow {
@@ -52,9 +54,12 @@ export default function TrendBoard() {
 
   const [drawerPointId, setDrawerPointId] = useState<string | null>(null)
   const [onlyExceeded, setOnlyExceeded] = useState(false)
+  /** 口径输入弹窗 */
   const [thresholdOpen, setThresholdOpen] = useState(false)
   const [editingPoint, setEditingPoint] = useState<Point | null>(null)
   const [thresholdForm] = Form.useForm<{ initialValue: number; threshold: number }>()
+  /** 初值/阈值调整预检草稿；非空时弹出预检弹窗 */
+  const [recheckDrafts, setRecheckDrafts] = useState<RecheckDraft[]>([])
 
   const filter = pointStore.filter
   const filterSelects = useMemo(
@@ -154,11 +159,22 @@ export default function TrendBoard() {
     if (!editingPoint) return
     const values = await thresholdForm.validateFields().catch(() => null)
     if (!values) return
-    await pointStore.updatePoint(editingPoint.id, {
-      initialValue: values.initialValue,
-      threshold: values.threshold
-    })
-    message.success(`${editingPoint.code} 初值与阈值已更新，历史观测偏差已重算`)
+    const caliberChanged =
+      Number(values.initialValue) !== editingPoint.initialValue || Number(values.threshold) !== editingPoint.threshold
+    if (!caliberChanged) {
+      message.info('初值与阈值均未变化')
+      setThresholdOpen(false)
+      return
+    }
+    // 进入影响预检：列出观测级别变化与受影响预警，确认后才原子写入
+    setRecheckDrafts([
+      {
+        pointId: editingPoint.id,
+        initialValue: Number(values.initialValue) || 0,
+        threshold: Number(values.threshold) > 0 ? Number(values.threshold) : 1,
+        unit: editingPoint.unit
+      }
+    ])
     setThresholdOpen(false)
   }
 
@@ -384,8 +400,18 @@ export default function TrendBoard() {
           >
             <InputNumber min={0.01} step={0.5} style={{ width: '100%' }} />
           </Form.Item>
+          <p className="muted" style={{ margin: 0 }}>
+            保存后将先做影响预检：重算该测点历史观测级别并列出受影响预警，确认后才会写入。
+          </p>
         </Form>
       </Modal>
+
+      <RecheckPreviewModal
+        open={recheckDrafts.length > 0}
+        drafts={recheckDrafts}
+        title={editingPoint ? `初值/阈值调整预检 · ${editingPoint.code}` : '初值/阈值调整预检'}
+        onClose={() => setRecheckDrafts([])}
+      />
     </div>
   )
 }

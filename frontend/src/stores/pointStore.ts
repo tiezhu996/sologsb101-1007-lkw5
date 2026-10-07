@@ -4,7 +4,8 @@
  */
 import { create } from 'zustand'
 import { liveQuery } from 'dexie'
-import { createId, db, deletePointCascade, type PointRow } from '@/utils/db'
+import { commitRecheck, createId, db, deletePointCascade, loadRecheckInputs, type PointRow } from '@/utils/db'
+import { buildRecheckPreview } from '@/utils/recheck'
 import {
   createEmptyPointFilter,
   POINT_UNIT,
@@ -14,6 +15,13 @@ import {
   type PointType,
   type ThresholdDraft
 } from '@/types/point'
+import {
+  DEFAULT_RECHECK_POLICY,
+  type RecheckCommitResult,
+  type RecheckDraft,
+  type RecheckPolicy,
+  type RecheckPreview
+} from '@/types/recheck'
 
 interface PointState {
   points: Point[]
@@ -30,8 +38,10 @@ interface PointState {
   bulkCreatePoints: (sectionId: string, drafts: PointDraft[]) => Promise<number>
   setThresholdDraft: (pointId: string, draft: ThresholdDraft) => void
   clearThresholdDraft: (pointId?: string) => void
-  commitThresholdDraft: (pointId: string) => Promise<void>
-  commitAllThresholdDrafts: () => Promise<number>
+  /** 影响预检：只算不写，返回观测级别变化条数与受影响预警清单 */
+  previewRecheck: (drafts: RecheckDraft[], policy?: RecheckPolicy) => Promise<RecheckPreview>
+  /** 确认提交：测点、观测、未闭环预警在单事务内原子落库，失败整体回滚；成功后清草稿 */
+  applyRecheck: (drafts: RecheckDraft[], policy?: RecheckPolicy) => Promise<RecheckCommitResult>
   toggleSelect: (id: string, checked: boolean) => void
   setSelectedIds: (ids: string[]) => void
   clearSelection: () => void
@@ -125,34 +135,29 @@ export const usePointStore = create<PointState>((set, get) => ({
     set({ thresholdDraft: next })
   },
 
-  async commitThresholdDraft(pointId) {
-    const draft = get().thresholdDraft[pointId]
-    if (!draft) return
-    await db.points.update(pointId, {
-      initialValue: draft.initialValue,
-      threshold: draft.threshold > 0 ? draft.threshold : 1,
-      updatedAt: Date.now()
-    })
-    get().clearThresholdDraft(pointId)
+  async previewRecheck(drafts, policy = DEFAULT_RECHECK_POLICY) {
+    const inputs = await loadRecheckInputs(drafts)
+    return buildRecheckPreview(
+      inputs.map((item) => ({
+        point: item.point,
+        draft: item.draft,
+        observations: item.observations,
+        alarms: item.alarms
+      })),
+      policy
+    )
   },
 
-  async commitAllThresholdDrafts() {
-    const entries = Object.entries(get().thresholdDraft)
-    if (entries.length === 0) return 0
-    const rows = get()
-      .points.filter((point) => entries.some(([id]) => id === point.id))
-      .map((point) => {
-        const draft = get().thresholdDraft[point.id]
-        return {
-          ...point,
-          initialValue: draft.initialValue,
-          threshold: draft.threshold > 0 ? draft.threshold : 1,
-          updatedAt: Date.now()
-        }
-      })
-    if (rows.length > 0) await db.points.bulkPut(rows)
-    get().clearThresholdDraft()
-    return rows.length
+  async applyRecheck(drafts, policy = DEFAULT_RECHECK_POLICY) {
+    // commitRecheck 在单个 Dexie 事务内写测点 / 观测 / 预警，任一失败整体回滚
+    const result = await commitRecheck(drafts, policy)
+    const appliedIds = new Set(result.pointIds)
+    const remaining = { ...get().thresholdDraft }
+    appliedIds.forEach((id) => {
+      delete remaining[id]
+    })
+    set({ thresholdDraft: remaining })
+    return result
   },
 
   toggleSelect(id, checked) {

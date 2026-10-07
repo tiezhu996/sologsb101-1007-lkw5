@@ -253,3 +253,46 @@ body {
   align-items: center;
   gap: 8px;
 }
+
+/* 初值/阈值调整影响预检统计块 */
+.recheck-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(128px, 1fr));
+  gap: 8px;
+}
+
+.recheck-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 10px 8px;
+  border: 1px solid var(--td-line);
+  border-radius: 10px;
+  background: #f8fafc;
+}
+
+.recheck-stat__num {
+  font-size: 22px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  color: var(--td-ink);
+}
+
+.recheck-stat__label {
+  font-size: 12px;
+  color: var(--td-ink-soft);
+  text-align: center;
+}
+
+/* 预警处置页：待复核行高亮 */
+.alarm-row-review > td {
+  background: #fffaf0 !important;
+}
+
+.alarm-review-tag {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+}
+

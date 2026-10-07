@@ -4,7 +4,7 @@
  * 消费 Alarm、Point、Observation；复用 <AlarmTag>、<FilterBar>、<StatBadge>、<EmptyPanel>。
  */
 import { useMemo, useState } from 'react'
-import { App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag } from 'antd'
+import { App as AntdApp, Button, Form, Input, InputNumber, Modal, Popconfirm, Select, Space, Table, Tag, Tooltip } from 'antd'
 import type { TableColumnsType } from 'antd'
 import AlarmTag from '@/components/common/AlarmTag'
 import EmptyPanel from '@/components/common/EmptyPanel'
@@ -39,6 +39,8 @@ export default function AlarmBoard() {
   const [closeOpen, setCloseOpen] = useState(false)
   const [closeTarget, setCloseTarget] = useState<Alarm | null>(null)
   const [closeForm] = Form.useForm<{ handler: string; measure: string }>()
+  /** 只看「待复核」预警 */
+  const [onlyReview, setOnlyReview] = useState(false)
 
   const filterSelects = useMemo(
     () => [
@@ -71,6 +73,7 @@ export default function AlarmBoard() {
     if (levels.length > 0 && !levels.includes(alarm.level)) return false
     if (alarmStore.stateFilter.length > 0 && !alarmStore.stateFilter.includes(alarm.state)) return false
     if (alarmStore.onlyOpen && alarm.state === '已闭环') return false
+    if (onlyReview && alarm.reviewFlag !== true) return false
     const text = keyword.trim().toLowerCase()
     if (text.length === 0) return true
     const point = pointStore.points.find((item) => item.id === alarm.pointId)
@@ -124,6 +127,11 @@ export default function AlarmBoard() {
   const remove = async (alarm: Alarm): Promise<void> => {
     await alarmStore.removeAlarm(alarm.id)
     message.success('预警单已删除')
+  }
+
+  const dismissReview = async (alarm: Alarm): Promise<void> => {
+    await alarmStore.clearReviewFlag(alarm.id)
+    message.success(`${pointStore.points.find((item) => item.id === alarm.pointId)?.code ?? '该测点'} 待复核标记已消除`)
   }
 
   const advance = async (alarm: Alarm): Promise<void> => {
@@ -195,6 +203,25 @@ export default function AlarmBoard() {
         </Tag>
       )
     },
+    {
+      title: '复核',
+      width: 150,
+      render: (_value, record) =>
+        record.reviewFlag ? (
+          <Tooltip title={record.reviewNote || '初值/阈值重算后该记录转为正常，保留原单待人工确认'}>
+            <span className="alarm-review-tag">
+              <Tag color="gold" style={{ margin: 0 }}>
+                待复核
+              </Tag>
+              <Button type="link" size="small" style={{ padding: 0, height: 18 }} onClick={() => dismissReview(record)}>
+                手工消除标记
+              </Button>
+            </span>
+          </Tooltip>
+        ) : (
+          <span className="muted">—</span>
+        )
+    },
     { title: '处置人', dataIndex: 'handler', width: 100, render: (value: string) => value || '—' },
     { title: '处置措施', dataIndex: 'measure', width: 220, render: (value: string) => value || '—' },
     {
@@ -229,6 +256,13 @@ export default function AlarmBoard() {
         </div>
         <div className="page-head__actions">
           <Button
+            type={onlyReview ? 'primary' : 'default'}
+            danger={onlyReview}
+            onClick={() => setOnlyReview((value) => !value)}
+          >
+            {onlyReview ? '查看全部预警' : `只看待复核（${alarmStore.reviewCount()}）`}
+          </Button>
+          <Button
             onClick={() => {
               alarmStore.patchFilter({ onlyOpen: !alarmStore.onlyOpen })
             }}
@@ -245,7 +279,8 @@ export default function AlarmBoard() {
         <StatBadge label="预警总数" value={alarmStore.alarms.length} suffix="张" tone="primary" />
         <StatBadge label="待处置" value={counts['待处置']} suffix="张" tone="warning" />
         <StatBadge label="处置中" value={counts['处置中']} suffix="张" tone="info" />
-        <StatBadge label="闭环率" value={alarmStore.closedPercent()} percent={alarmStore.closedPercent()} tone="danger" hint={`红 ${levelCounts['红']} / 橙 ${levelCounts['橙']} / 黄 ${levelCounts['黄']} / 蓝 ${levelCounts['蓝']}`} />
+        <StatBadge label="待复核" value={alarmStore.reviewCount()} suffix="张" tone="danger" hint="初值/阈值重算后转正常、保留原单待人工确认的预警" />
+        <StatBadge label="闭环率" value={alarmStore.closedPercent()} percent={alarmStore.closedPercent()} tone="success" hint={`红 ${levelCounts['红']} / 橙 ${levelCounts['橙']} / 黄 ${levelCounts['黄']} / 蓝 ${levelCounts['蓝']}`} />
       </div>
 
       <FilterBar model={model} selects={filterSelects} keywordPlaceholder="搜索测点编号 / 处置人 / 措施" onModelChange={onModelChange} />
@@ -268,7 +303,16 @@ export default function AlarmBoard() {
             compact
           />
         ) : (
-          <Table<Alarm> rowKey="id" size="small" bordered dataSource={rows} columns={columns} pagination={false} scroll={{ x: 1400 }} />
+          <Table<Alarm>
+            rowKey="id"
+            size="small"
+            bordered
+            dataSource={rows}
+            columns={columns}
+            pagination={false}
+            rowClassName={(record) => (record.reviewFlag ? 'alarm-row-review' : '')}
+            scroll={{ x: 1520 }}
+          />
         )}
       </div>
 

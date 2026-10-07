@@ -25,6 +25,9 @@ interface AlarmState_ {
   removeAlarm: (id: string) => Promise<void>
   advance: (id: string) => Promise<AlarmState | null>
   closeAlarm: (id: string, handler: string, measure: string) => Promise<void>
+  /** 手工消除「待复核」标记（预警单本身保留） */
+  clearReviewFlag: (id: string) => Promise<void>
+  reviewCount: () => number
   counts: () => Record<AlarmState, number>
   levelCounts: () => Record<AlarmLevel, number>
   closedPercent: () => number
@@ -93,8 +96,24 @@ export const useAlarmStore = create<AlarmState_>((set, get) => ({
       state: '已闭环',
       handler: handler.trim() || '未署名',
       measure: measure.trim() || '处置完成，复测无异常',
+      reviewFlag: false,
+      reviewNote: '',
+      reviewAt: undefined,
       updatedAt: Date.now()
     })
+  },
+
+  async clearReviewFlag(id) {
+    await db.alarms.update(id, {
+      reviewFlag: false,
+      reviewNote: '',
+      reviewAt: undefined,
+      updatedAt: Date.now()
+    })
+  },
+
+  reviewCount() {
+    return get().alarms.filter((alarm) => alarm.reviewFlag === true).length
   },
 
   counts() {

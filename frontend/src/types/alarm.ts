@@ -16,6 +16,12 @@ export interface Alarm {
   handler: string
   /** 处置措施 */
   measure: string
+  /** 待复核标记：初值/阈值重算后由越限转为正常，保留原单待人工确认 */
+  reviewFlag?: boolean
+  /** 待复核原因（重判时间、口径变化），供预警处置页展示 */
+  reviewNote?: string
+  /** 加入待复核的时间戳 */
+  reviewAt?: number
   createdAt: number
   updatedAt: number
 }
